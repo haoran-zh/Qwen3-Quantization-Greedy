@@ -7,6 +7,7 @@ import transformers
 import quant
 from texttable import Texttable
 from utils import torch_snr_error
+import utils.quip_utils as quip_utils
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -53,9 +54,9 @@ class Observer:
         return self.loss_list
 
 
-class GPTQ:
+class GPTAQ:
 
-    def __init__(self, layer, observe=False):
+    def __init__(self, layer, observe=False, store_delta_x=False):
         self.layer = layer
         self.dev = self.layer.weight.device
         W = layer.weight.data.clone()
@@ -71,9 +72,12 @@ class GPTQ:
         self.quantizer = quant.Quantizer()
         self.observe = observe
         self.inps = []
+        self.inp1 = None
+        self.out1 = None
+        self.store_delta_x = store_delta_x
+        self.delta_x_values = [] if store_delta_x else None  # Store |deltaX| values for plotting
 
     def add_batch(self, inp, out):
-        # Hessian H = 2 X XT + λ I
         if self.observe:
             self.inp1 = inp
             self.out1 = out
@@ -84,46 +88,26 @@ class GPTQ:
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
-            if len(inp.shape) == 3:
-                inp = inp.reshape((-1, inp.shape[-1]))
-            inp = inp.t()
-        if isinstance(self.layer, nn.Conv2d):
-            unfold = nn.Unfold(self.layer.kernel_size, dilation=self.layer.dilation, padding=self.layer.padding, stride=self.layer.stride)
-            inp = unfold(inp)
-            inp = inp.permute([1, 0, 2])
-            inp = inp.flatten(1)
+        if len(inp.shape) == 3:
+            inp = inp.reshape((-1, inp.shape[-1]))
+
+        inp = inp.t()
+
         self.H *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples += tmp
-        # inp = inp.float()
-        inp = math.sqrt(2 / self.nsamples) * inp.float()
-        # self.H += 2 / self.nsamples * inp.matmul(inp.t())
-        self.H += inp.matmul(inp.t())
-        self.inps.append(inp.cpu())
-
-    def add_batch_v2(self, inp, out):
-
-        if len(inp.shape) == 2:
-            inp = inp.unsqueeze(0)
-        tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
-            if len(inp.shape) == 3:
-                inp = inp.reshape((-1, inp.shape[-1]))
-            inp = inp.t()
-        if isinstance(self.layer, nn.Conv2d):
-            unfold = nn.Unfold(self.layer.kernel_size, dilation=self.layer.dilation, padding=self.layer.padding, stride=self.layer.stride)
-            inp = unfold(inp)
-            inp = inp.permute([1, 0, 2])
-            inp = inp.flatten(1)
         self.dXXT *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
-        # inp = inp.float()
-        native_inp = math.sqrt(2 / self.nsamples) * inp.float()
-        # self.H += 2 / self.nsamples * inp.matmul(inp.t())
-        # native_inp = math.sqrt(2 / self.nsamples) * native_inp
+        inp = math.sqrt(2 / self.nsamples) * inp.float()
+        self.H += inp.matmul(inp.t())
+        dX = self.fp_inp[0].float() * math.sqrt(2 / self.nsamples) - inp
+        self.dXXT += dX.matmul(inp.t())
+        
+        # Store |deltaX| for plotting only if enabled: shape is [channels, samples]
+        if self.store_delta_x:
+            abs_dX = torch.abs(dX)  # |deltaX| per channel
+            self.delta_x_values.append(abs_dX.cpu().clone())
 
-        inp_ = self.inps.pop(0).to(device=inp.device, dtype=torch.float32)
-        self.dXXT += (native_inp-inp_).matmul(inp_.t())
+        del self.fp_inp[0]
+
 
     def print_loss(self, name, q_weight, weight_error, timecost):
         table = Texttable()
@@ -152,11 +136,9 @@ class GPTQ:
         table.add_row([name, weight_error, fp_SNR, q_SNR, timecost])
         print(table.draw().split('\n')[-2])
 
-    def fasterquant(self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, name='', fp_weight=None, alpha=0.25, beta=0.0003, ours=False, ours_v2=False, gptqv2=False):
+    def fasterquant(self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, name='', fp_weight=None, alpha=0.25, beta=None, args=None):
         self.layer.to(self.dev)
 
-        if fp_weight is None:
-            fp_weight = self.layer.weight.data.clone()
 
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
@@ -171,46 +153,53 @@ class GPTQ:
             self.quantizer.find_params(W, weight=True)
 
         H = self.H
-        # if not self.observe:
-        #     del self.H
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
         self.dXXT[:, dead] = 0
+        D = self.dXXT.clone()
+
+        if args.incoh_process:
+            Hr, Dr, Wr, SU, SV, scaleWH = incoherence_preprocess(W, H, D, args)
+        else:
+            Hr = H
+            Dr = D
+            Wr = W
+            SU = None
+            SV = None
+            scaleWH = None
 
         if actorder:
-            perm = torch.argsort(torch.diag(H), descending=True)
-            W = W[:, perm]
-            fp_weight = fp_weight.to(W.device)[:, perm]
-            H = H[perm][:, perm]
-            self.dXXT = self.dXXT[perm][:, perm]
+            perm = torch.argsort(torch.diag(Hr), descending=True)
+            Wr = Wr[:, perm]
+            Hr = Hr[perm][:, perm]
+            Dr= Dr[perm][:, perm]
 
-        Losses = torch.zeros_like(W)
-        Q = torch.zeros_like(W)
+        Losses = torch.zeros_like(Wr)
+        Q = torch.zeros_like(Wr)
 
         # import pdb; pdb.set_trace()
-        damp = percdamp * torch.mean(torch.diag(H))
+        damp = percdamp * torch.mean(torch.diag(Hr))
         diag = torch.arange(self.columns, device=self.dev)
-        H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
+        Hr[diag, diag] += damp
+        Hr = torch.linalg.cholesky(Hr)
+        Hr = torch.cholesky_inverse(Hr)
+        Hr = torch.linalg.cholesky(Hr, upper=True)
+        Hinv = Hr
 
         g_idx = []
         scale = []
         zero = []
         now_idx = 1
 
-        P = alpha * ((self.dXXT @ Hinv.T).triu(diagonal=1)) @ Hinv
-        del self.dXXT
+        P = alpha * ((Dr @ Hinv.T).triu(diagonal=1)) @ Hinv
+        del self.dXXT, Dr
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
 
-            W1 = W[:, i1:i2].clone()
-            fp_weight1 = fp_weight[:, i1:i2] # todo
+            W1 = Wr[:, i1:i2].clone()
             Q1 = torch.zeros_like(W1)
             Err1 = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
@@ -218,14 +207,13 @@ class GPTQ:
             P1 = P[i1:i2, i1:i2]
 
             for i in range(count):
-                # if ours:
-                #     W1[:, i] -= (W1[:, i]-fp_weight1[:, i]) * alpha
+
                 w = W1[:, i]
                 d = Hinv1[i, i]
 
                 if groupsize != -1:
                     if (i1 + i) % groupsize == 0:
-                        self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)], weight=True)
+                        self.quantizer.find_params(Wr[:, (i1 + i):(i1 + i + groupsize)], weight=True)
 
                     if ((i1 + i) // groupsize) - now_idx == -1:
                         scale.append(self.quantizer.scale)
@@ -239,59 +227,30 @@ class GPTQ:
                 # import pdb; pdb.set_trace()
 
                 err1 = (w - q) / d
-                if ours_v2:
-                    if gptqv2:
-                        W1[:, i:] = W1[:, i:] - err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) + w.unsqueeze(1).matmul(P1[i, i:].unsqueeze(0)) - (W1[:, i:]-fp_weight1[:, i:]) @ (Hinv1[i:,i:].t()@Hinv1[i:,i:]) * beta
-                    else:
-                        W1[:, i:] = W1[:, i:] - err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - (W1[:, i:]-fp_weight1[:, i:]) @ (Hinv1[i:,i:].t()@Hinv1[i:,i:]) * beta
-                else:
-                    if gptqv2:
-                        W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - w.unsqueeze(1).matmul(P1[i, i:].unsqueeze(0))
-                    else:
-                        W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) # raw
-                #     # W1[:, i+1] -= (W1[:, i+1]-fp_weight1[:, i+1]) * (Hinv1[i+1,i+1]**2) * 0.1
-
-                # err1 = (w - q) / d + (W1[:, i:]-fp_weight1[:, i:].to(W1.device)) * 0.1 # todo
-                # W1[:, i:] = W1[:, i:] - err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - (W1[:, i:]-fp_weight1[:, i:]) * 0.1
-                # import pdb; pdb.set_trace()
-                # W1[:, i:] = W1[:, i:] - err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - (W1[:, i:]-fp_weight1[:, i:]) @ (Hinv1[i:,i:].t()@Hinv1[i:,i:]) * 0.1
+                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - w.unsqueeze(1).matmul(P1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
 
             Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
 
-            # import pdb; pdb.set_trace()
-            if ours_v2:
-                if gptqv2:
-                    W[:, i2:] = W[:, i2:] - Err1.matmul(Hinv[i1:i2, i2:]) + W1.matmul(P[i1:i2, i2:]) - (W[:, i2:] - fp_weight[:, i2:]) @ (Hinv[i2:, i2:].t()@Hinv[i2:, i2:]) * beta
-                else:
-                    W[:, i2:] = W[:, i2:] - Err1.matmul(Hinv[i1:i2, i2:]) - (W[:, i2:] - fp_weight[:, i2:]) @ (Hinv[i2:, i2:].t()@Hinv[i2:, i2:]) * beta
-            else:
-                if gptqv2:
-                    W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:]) - W1.matmul(P[i1:i2, i2:])
-                else:
-                    W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-            # alpha = 0.1
-            # W[:, i2:] = (1-alpha) * W[:, i2:] + alpha * fp_weight[:, i2:] - Err1.matmul(Hinv[i1:i2, i2:])
-            # W[:, i1:i2] = (1-alpha) * W[:, i1:i2] + alpha * fp_weight[:, i1:i2]
-            # W[:, i2:] = W[:, i2:] - Err1.matmul(Hinv[i1:i2, i2:]) - (W[:, i2:] - fp_weight[:, i2:]) @ (Hinv[i2:, i2:].t()@Hinv[i2:, i2:]) * 0.1
-            if ours_v2:
-                del fp_weight1
-        if ours_v2:
-            del fp_weight
+            Wr[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:]) - W1.matmul(P[i1:i2, i2:])
 
         torch.cuda.synchronize()
         error = torch.sum(Losses).item()
-        # error = torch.mean(Losses).item()
 
         groupsize = groupsize if groupsize != -1 else self.columns
         g_idx = [i // groupsize for i in range(self.columns)]
         g_idx = torch.tensor(g_idx, dtype=torch.int32, device=Q.device)
+        
         if actorder:
             invperm = torch.argsort(perm)
             Q = Q[:, invperm]
             g_idx = g_idx[invperm]
 
+        if args.incoh_process:
+            Q = incoherence_process(Q, SU, SV, scaleWH, args)
+        torch.cuda.synchronize()
+        
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
 
@@ -299,9 +258,6 @@ class GPTQ:
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
             self.layer.weight.data.dtype
         )
-        # print(W)
-        # fp_weight = fp_weight.cpu()
-        # del fp_weight
 
         self.print_loss(name=name, q_weight=Q, weight_error=error, timecost=(time.time() - tick))
 
@@ -316,6 +272,95 @@ class GPTQ:
         self.inp1 = None
         self.out1 = None
         self.H = None
+        self.dXXT = None 
         self.Losses = None
         self.Trace = None
         torch.cuda.empty_cache()
+
+
+
+def RHT_H(H, SU):
+    return quip_utils.matmul_hadUt(quip_utils.matmul_hadUt(H * SU).T * SU)
+
+
+def RHT_W(W, SU, SV):
+    return quip_utils.matmul_hadUt(quip_utils.matmul_hadUt(W.T * SV).T * SU)
+
+
+def incoherence_preprocess(W, H, D, args):
+    dtype_ = torch.float32
+    device = H.device
+    (m, n) = W.shape
+
+    # diagonally rescale W,H to minimize proxy loss
+    scaleWH = None
+    Wr = W
+    Hr = H
+    Dr = D 
+    if args.rescale_WH:
+        Hr = H / H.abs().max()
+        diagH = torch.diag(Hr)
+        diagW2 = torch.diag(W.T @ W)
+        diagH = torch.clamp(diagH, min=1e-8)
+        diagW2 = torch.clamp(diagW2, min=1e-8)
+        scaleWH = (diagH / diagW2).sqrt().sqrt().to(torch.float32)
+        scaleWH = scaleWH.clamp(min=1e-8)
+        Wr = Wr * scaleWH[None, :]
+        Hr = Hr / scaleWH[None, :]
+        Hr = Hr / scaleWH[:, None]
+        if D is not None:
+            Dr = Dr / scaleWH[None, :]
+            Dr = Dr / scaleWH[:, None]
+        scaleWH = scaleWH.cpu()
+
+    # randomized hadamard transformation on H, W
+    if args.incoh_mode == "had":
+        SU = (torch.randn(n, device=device).sign() + 1e-5).sign().to(dtype_)
+        SV = (torch.randn(m, device=device).sign() + 1e-5).sign().to(dtype_)
+        Hr = RHT_H(Hr, SU)
+        if D is not None:
+            Dr = RHT_H(Dr, SU).T # transpose since D is not symmetric 
+        Wr = RHT_W(Wr, SU, SV)
+    
+    # randomized kronecker product on H, W
+    elif args.incoh_mode == "kron":
+        SU = quip_utils.rand_ortho_butterfly_noblock(n).to(dtype_).to(device)
+        SV = quip_utils.rand_ortho_butterfly_noblock(m).to(dtype_).to(device)
+        Hr = SU @ Hr @ SU.T
+        if D is not None:
+            Dr = SU @ Dr @ SU.T
+        Wr = SV @ Wr @ SU.T
+    else:
+        raise NotImplementedError
+    SV = SV.cpu()
+    SU = SU.cpu()
+
+    # Handle dead columns after transformation
+    dead = torch.diag(Hr) == 0
+    Hr[dead, dead] = 1
+    Wr[:, dead] = 0
+
+    Wr = Wr.to(device)
+
+    return Hr, Dr, Wr, SU, SV, scaleWH
+
+
+def incoherence_process(hatWr, SU, SV, scaleWH, args):
+    device = hatWr.device
+    # reverse hadamard transformation
+    if args.incoh_mode == 'had':
+        hatWr = (quip_utils.matmul_hadU(
+            (quip_utils.matmul_hadU(hatWr) * SU.to(device)).T) * SV.to(device)).T
+    # reverse kronecker product
+    elif args.incoh_mode == 'kron':
+        hatWr = SV.T.to(device) @ hatWr @ SU.to(device)
+    else:
+        raise NotImplementedError
+
+    # reverse rescale W,H
+    if args.rescale_WH:
+        hatWr /= scaleWH[None, :].to(device)
+
+    assert torch.isfinite(hatWr).all()
+    return hatWr
+

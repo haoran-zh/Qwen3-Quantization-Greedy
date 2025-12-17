@@ -53,7 +53,7 @@ class Observer:
         return self.loss_list
 
 
-class GPTQ:
+class FOEM:
 
     def __init__(self, layer, observe=False):
         self.layer = layer
@@ -70,7 +70,8 @@ class GPTQ:
         self.nsamples = 0
         self.quantizer = quant.Quantizer()
         self.observe = observe
-        self.inps = []
+        self.inp1 = None
+        self.out1 = None
 
     def add_batch(self, inp, out):
         # Hessian H = 2 X XT + λ I
@@ -99,31 +100,7 @@ class GPTQ:
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         # self.H += 2 / self.nsamples * inp.matmul(inp.t())
         self.H += inp.matmul(inp.t())
-        self.inps.append(inp.cpu())
 
-    def add_batch_v2(self, inp, out):
-
-        if len(inp.shape) == 2:
-            inp = inp.unsqueeze(0)
-        tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
-            if len(inp.shape) == 3:
-                inp = inp.reshape((-1, inp.shape[-1]))
-            inp = inp.t()
-        if isinstance(self.layer, nn.Conv2d):
-            unfold = nn.Unfold(self.layer.kernel_size, dilation=self.layer.dilation, padding=self.layer.padding, stride=self.layer.stride)
-            inp = unfold(inp)
-            inp = inp.permute([1, 0, 2])
-            inp = inp.flatten(1)
-        self.dXXT *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples += tmp
-        # inp = inp.float()
-        native_inp = math.sqrt(2 / self.nsamples) * inp.float()
-        # self.H += 2 / self.nsamples * inp.matmul(inp.t())
-        # native_inp = math.sqrt(2 / self.nsamples) * native_inp
-
-        inp_ = self.inps.pop(0).to(device=inp.device, dtype=torch.float32)
-        self.dXXT += (native_inp-inp_).matmul(inp_.t())
 
     def print_loss(self, name, q_weight, weight_error, timecost):
         table = Texttable()
@@ -152,7 +129,7 @@ class GPTQ:
         table.add_row([name, weight_error, fp_SNR, q_SNR, timecost])
         print(table.draw().split('\n')[-2])
 
-    def fasterquant(self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, name='', fp_weight=None, alpha=0.25, beta=0.0003, ours=False, ours_v2=False, gptqv2=False):
+    def fasterquant(self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, name='', fp_weight=None, alpha=0.25, beta=0.0003):
         self.layer.to(self.dev)
 
         if fp_weight is None:
@@ -171,12 +148,12 @@ class GPTQ:
             self.quantizer.find_params(W, weight=True)
 
         H = self.H
+        del self.H
         # if not self.observe:
         #     del self.H
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
         W[:, dead] = 0
-        self.dXXT[:, dead] = 0
 
         if actorder:
             perm = torch.argsort(torch.diag(H), descending=True)
@@ -202,8 +179,6 @@ class GPTQ:
         zero = []
         now_idx = 1
 
-        P = alpha * ((self.dXXT @ Hinv.T).triu(diagonal=1)) @ Hinv
-        del self.dXXT
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -215,11 +190,9 @@ class GPTQ:
             Err1 = torch.zeros_like(W1)
             Losses1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
-            P1 = P[i1:i2, i1:i2]
 
             for i in range(count):
-                # if ours:
-                #     W1[:, i] -= (W1[:, i]-fp_weight1[:, i]) * alpha
+
                 w = W1[:, i]
                 d = Hinv1[i, i]
 
@@ -237,48 +210,16 @@ class GPTQ:
                 Losses1[:, i] = (w - q)**2 / d**2
 
                 # import pdb; pdb.set_trace()
-
                 err1 = (w - q) / d
-                if ours_v2:
-                    if gptqv2:
-                        W1[:, i:] = W1[:, i:] - err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) + w.unsqueeze(1).matmul(P1[i, i:].unsqueeze(0)) - (W1[:, i:]-fp_weight1[:, i:]) @ (Hinv1[i:,i:].t()@Hinv1[i:,i:]) * beta
-                    else:
-                        W1[:, i:] = W1[:, i:] - err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - (W1[:, i:]-fp_weight1[:, i:]) @ (Hinv1[i:,i:].t()@Hinv1[i:,i:]) * beta
-                else:
-                    if gptqv2:
-                        W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - w.unsqueeze(1).matmul(P1[i, i:].unsqueeze(0))
-                    else:
-                        W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) # raw
-                #     # W1[:, i+1] -= (W1[:, i+1]-fp_weight1[:, i+1]) * (Hinv1[i+1,i+1]**2) * 0.1
 
-                # err1 = (w - q) / d + (W1[:, i:]-fp_weight1[:, i:].to(W1.device)) * 0.1 # todo
-                # W1[:, i:] = W1[:, i:] - err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - (W1[:, i:]-fp_weight1[:, i:]) * 0.1
-                # import pdb; pdb.set_trace()
-                # W1[:, i:] = W1[:, i:] - err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - (W1[:, i:]-fp_weight1[:, i:]) @ (Hinv1[i:,i:].t()@Hinv1[i:,i:]) * 0.1
+                W1[:, i:] = W1[:, i:] - err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - (W1[:, i:]-fp_weight1[:, i:]) @ (Hinv1[i:,i:].t()@Hinv1[i:,i:]) * beta
                 Err1[:, i] = err1
 
             Q[:, i1:i2] = Q1
             Losses[:, i1:i2] = Losses1 / 2
 
-            # import pdb; pdb.set_trace()
-            if ours_v2:
-                if gptqv2:
-                    W[:, i2:] = W[:, i2:] - Err1.matmul(Hinv[i1:i2, i2:]) + W1.matmul(P[i1:i2, i2:]) - (W[:, i2:] - fp_weight[:, i2:]) @ (Hinv[i2:, i2:].t()@Hinv[i2:, i2:]) * beta
-                else:
-                    W[:, i2:] = W[:, i2:] - Err1.matmul(Hinv[i1:i2, i2:]) - (W[:, i2:] - fp_weight[:, i2:]) @ (Hinv[i2:, i2:].t()@Hinv[i2:, i2:]) * beta
-            else:
-                if gptqv2:
-                    W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:]) - W1.matmul(P[i1:i2, i2:])
-                else:
-                    W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-            # alpha = 0.1
-            # W[:, i2:] = (1-alpha) * W[:, i2:] + alpha * fp_weight[:, i2:] - Err1.matmul(Hinv[i1:i2, i2:])
-            # W[:, i1:i2] = (1-alpha) * W[:, i1:i2] + alpha * fp_weight[:, i1:i2]
-            # W[:, i2:] = W[:, i2:] - Err1.matmul(Hinv[i1:i2, i2:]) - (W[:, i2:] - fp_weight[:, i2:]) @ (Hinv[i2:, i2:].t()@Hinv[i2:, i2:]) * 0.1
-            if ours_v2:
-                del fp_weight1
-        if ours_v2:
-            del fp_weight
+
+            W[:, i2:] = W[:, i2:] - Err1.matmul(Hinv[i1:i2, i2:]) - (W[:, i2:] - fp_weight[:, i2:]) @ (Hinv[i2:, i2:].t()@Hinv[i2:, i2:]) * beta
 
         torch.cuda.synchronize()
         error = torch.sum(Losses).item()
@@ -299,9 +240,6 @@ class GPTQ:
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
             self.layer.weight.data.dtype
         )
-        # print(W)
-        # fp_weight = fp_weight.cpu()
-        # del fp_weight
 
         self.print_loss(name=name, q_weight=Q, weight_error=error, timecost=(time.time() - tick))
 
