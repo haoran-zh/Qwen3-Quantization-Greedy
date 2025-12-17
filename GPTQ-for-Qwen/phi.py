@@ -9,11 +9,12 @@ import os
 import glob
 import pickle
 
-from transformers import Qwen3Config, Qwen3ForCausalLM, modeling_utils
+from transformers import PhiConfig, PhiForCausalLM, modeling_utils
 from gptq import GPTQ, Observer
 from utils import find_layers, DEV, get_loaders, export_quant_table, gen_conditions
 from texttable import Texttable
-from utils.plot_delta_x import save_alpha_trace_plot, save_alpha_per_module_plot, plot_delta_x_2d_3d, compute_and_save_layer_norms, plot_unified_mae, load_mae_from_pickle
+from utils.plot_delta_x import save_alpha_trace_plot, save_alpha_per_module_plot, plot_delta_x_2d_3d, \
+    compute_and_save_layer_norms, plot_unified_mae, load_mae_from_pickle
 import utils
 import copy
 import transformers
@@ -28,21 +29,20 @@ from algorithms.gptq import Observer  # Observer is the same across all algorith
 import tqdm
 
 
-def get_qwen(model='Qwen/Qwen3-8B'):
-
+def get_phi(model="microsoft/phi-1_5"):
     def skip(*args, **kwargs):
         pass
 
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    model = Qwen3ForCausalLM.from_pretrained(model, torch_dtype=torch.bfloat16,device_map="auto")
+    model = PhiForCausalLM.from_pretrained(model, torch_dtype=torch.bfloat16, device_map="auto")
     model.seqlen = 2048
     return model
 
 
 @torch.no_grad()
-def qwen3_sequential(model, dataloader, dev):
+def phi_sequential(model, dataloader, dev):
     print('Starting ...')
 
     use_cache = model.config.use_cache
@@ -69,6 +69,7 @@ def qwen3_sequential(model, dataloader, dev):
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
             raise ValueError
+
     # model = model.cuda()  # comment out this line following Seohyeon's code
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -119,7 +120,7 @@ def qwen3_sequential(model, dataloader, dev):
 
     for i in range(len(layers)):
 
-        print(f'Quantizing layer {i+1}/{len(layers)}..')
+        print(f'Quantizing layer {i + 1}/{len(layers)}..')
         print('+------------------+--------------+------------+-----------+-------+')
         print('|       name       | weight_error | fp_inp_SNR | q_inp_SNR | time  |')
         print('+==================+==============+============+===========+=======+')
@@ -133,7 +134,6 @@ def qwen3_sequential(model, dataloader, dev):
             for j in range(args.nsamples):
                 fp_inps[j] = layer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
             fp_inputs_cache.clear_hook()
-
 
         for names in sequential:
             subset = {n: full[n] for n in names}
@@ -167,6 +167,7 @@ def qwen3_sequential(model, dataloader, dev):
             def add_batch(name):
                 def tmp(_, inp, out):
                     gptq[name].add_batch(inp[0].data, out.data)
+
                 return tmp
 
             first_module_name = list(subset.keys())[0]
@@ -406,7 +407,7 @@ def qwen3_sequential(model, dataloader, dev):
 
 
 @torch.no_grad()
-def qwen_eval(model, testenc, dev):
+def phi_eval(model, testenc, dev):
     print('Evaluating ...')
 
     testenc = testenc.input_ids
@@ -604,7 +605,7 @@ def eval_with_mae(quantized_model, fp_model, testenc, dev, method_name: str = ""
         # Run FP layer
         for j in range(nsamples):
             outs_fp[j] = \
-            layer_fp(inps_fp[j].unsqueeze(0), attention_mask=attention_mask_fp, position_ids=position_ids_fp)[0]
+                layer_fp(inps_fp[j].unsqueeze(0), attention_mask=attention_mask_fp, position_ids=position_ids_fp)[0]
 
         # Compute MAE between FP and quantized outputs
         dx = outs_fp - outs_q  # [nsamples, seqlen, hidden_size]
@@ -627,7 +628,7 @@ def eval_with_mae(quantized_model, fp_model, testenc, dev, method_name: str = ""
 
 
 # TODO: perform packing on GPU
-def qwen_pack(model, quantizers, wbits, groupsize):
+def phi_pack(model, quantizers, wbits, groupsize):
     layers = find_layers(model)
     layers = {n: layers[n] for n in quantizers}
     quant.make_quant_linear(model, quantizers, wbits, groupsize)
@@ -642,7 +643,7 @@ def qwen_pack(model, quantizers, wbits, groupsize):
 
 
 def load_quant(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True, warmup_autotune=True):
-    config = Qwen3Config.from_pretrained(model)
+    config = PhiConfig.from_pretrained(model)
 
     def noop(*args, **kwargs):
         pass
@@ -654,7 +655,7 @@ def load_quant(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True
     torch.set_default_dtype(torch.half)
     modeling_utils._init_weights = False
     torch.set_default_dtype(torch.half)
-    model = Qwen3ForCausalLM(config)
+    model = PhiForCausalLM(config)
     torch.set_default_dtype(torch.float)
     if eval:
         model = model.eval()
@@ -689,7 +690,7 @@ def load_quant(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True
     return model
 
 
-def Qwen_multigpu(model, gpus, gpu_dist):
+def phi_multigpu(model, gpus, gpu_dist):
     model.model.embed_tokens = model.model.embed_tokens.to(gpus[0])
     if hasattr(model.model, 'norm') and model.model.norm:
         model.model.norm = model.model.norm.to(gpus[0])
@@ -703,7 +704,7 @@ def Qwen_multigpu(model, gpus, gpu_dist):
             super().__init__()
             self.module = module
             self.dev = next(iter(self.module.parameters())).device
-            self.invalidate_cache=invalidate_cache
+            self.invalidate_cache = invalidate_cache
 
         def forward(self, *inp, **kwargs):
             inp = list(inp)
@@ -717,7 +718,7 @@ def Qwen_multigpu(model, gpus, gpu_dist):
             if cache['position_ids'] is None or cache['position_ids'].device != self.dev or self.invalidate_cache:
                 cache['position_ids'] = kwargs['position_ids'].to(self.dev)
             kwargs['position_ids'] = cache['position_ids']
-            
+
             tmp = self.module(*inp, **kwargs)
             return tmp
 
@@ -726,21 +727,22 @@ def Qwen_multigpu(model, gpus, gpu_dist):
     if not gpu_dist:
         pergpu = ceil(len(layers) / len(gpus))
         for i in range(len(layers)):
-            layers[i] = MoveModule(layers[i].to(0 if i == 0 or i == len(layers) -1 else gpus[(i-1) // pergpu]), i==0)
+            layers[i] = MoveModule(layers[i].to(0 if i == 0 or i == len(layers) - 1 else gpus[(i - 1) // pergpu]),
+                                   i == 0)
     else:
         assert gpu_dist[0] >= 2, "At least two layers must be on GPU 0."
-        assigned_gpus = [0] * (gpu_dist[0]-1)
+        assigned_gpus = [0] * (gpu_dist[0] - 1)
         for i in range(1, len(gpu_dist)):
             assigned_gpus = assigned_gpus + [i] * gpu_dist[i]
 
-        remaining_assignments = len(layers)-len(assigned_gpus) - 1
+        remaining_assignments = len(layers) - len(assigned_gpus) - 1
         if remaining_assignments > 0:
             assigned_gpus = assigned_gpus + [-1] * remaining_assignments
 
         assigned_gpus = assigned_gpus + [0]
 
         for i in range(len(layers)):
-            layers[i] = MoveModule(layers[i].to(gpus[assigned_gpus[i]]), i==0)
+            layers[i] = MoveModule(layers[i].to(gpus[assigned_gpus[i]]), i == 0)
 
     model.gpus = gpus
 
@@ -781,7 +783,8 @@ def benchmark(model, input_ids, check=False):
         times = []
         for i in range(input_ids.numel()):
             tick = time.time()
-            out = model(input_ids[:, i:i + 1], past_key_values=cache['past'], attention_mask=attention_mask[:, :(i + 1)].reshape((1, -1)))
+            out = model(input_ids[:, i:i + 1], past_key_values=cache['past'],
+                        attention_mask=attention_mask[:, :(i + 1)].reshape((1, -1)))
             sync()
             times.append(time.time() - tick)
             print(i, times[-1])
@@ -805,15 +808,19 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('model', type=str, help='qwen model to load')
-    parser.add_argument('dataset', type=str, choices=['wikitext2', 'ptb', 'c4'], help='Where to extract calibration data from.')
+    parser.add_argument('model', type=str, help='phi model to load')
+    parser.add_argument('dataset', type=str, choices=['wikitext2', 'ptb', 'c4'],
+                        help='Where to extract calibration data from.')
     parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration data samples.')
-    parser.add_argument('--percdamp', type=float, default=.01, help='Percent of the average Hessian diagonal to use for dampening.')
+    parser.add_argument('--percdamp', type=float, default=.01,
+                        help='Percent of the average Hessian diagonal to use for dampening.')
     parser.add_argument('--nearest', action='store_true', help='Whether to run the RTN baseline.')
-    parser.add_argument('--wbits', type=int, default=16, choices=[2, 3, 4, 8, 16], help='#bits to use for quantization; use 16 for evaluating base model.')
+    parser.add_argument('--wbits', type=int, default=16, choices=[2, 3, 4, 8, 16],
+                        help='#bits to use for quantization; use 16 for evaluating base model.')
     parser.add_argument('--trits', action='store_true', help='Whether to use trits for quantization.')
-    parser.add_argument('--groupsize', type=int, default=-1, help='Groupsize to use for quantization; default uses full row.')
+    parser.add_argument('--groupsize', type=int, default=-1,
+                        help='Groupsize to use for quantization; default uses full row.')
     parser.add_argument('--eval', action='store_true', help='evaluate quantized model.')
     parser.add_argument('--test-generation', action='store_true', help='test generation.')
     parser.add_argument('--lm-eval', action='store_true', help='evaluate quantized model using lm_eval.')
@@ -825,42 +832,53 @@ if __name__ == '__main__':
         help='Tasks for lm_eval. Use format "task_name:num_fewshot" for few-shot tasks (e.g., "mmlu:5" for 5-shot MMLU).'
     )
     parser.add_argument('--save', type=str, default='', help='Save quantized checkpoint under this name.')
-    parser.add_argument('--save_safetensors', type=str, default='', help='Save quantized `.safetensors` checkpoint under this name.')
+    parser.add_argument('--save_safetensors', type=str, default='',
+                        help='Save quantized `.safetensors` checkpoint under this name.')
     parser.add_argument('--load', type=str, default='', help='Load quantized model.')
     parser.add_argument('--benchmark', type=int, default=0, help='Number of tokens to use for benchmarking.')
-    parser.add_argument('--check', action='store_true', help='Whether to compute perplexity during benchmarking for verification.')
+    parser.add_argument('--check', action='store_true',
+                        help='Whether to compute perplexity during benchmarking for verification.')
     parser.add_argument('--sym', action='store_true', help='Whether to perform symmetric quantization.')
     parser.add_argument('--act-order', action='store_true', help='Whether to apply the activation order GPTQ heuristic')
     parser.add_argument('--true-sequential', action='store_true', help='Whether to run in true sequential model.')
     parser.add_argument('--new-eval', action='store_true', help='Whether to use the new PTB and C4 eval')
-    parser.add_argument('--layers-dist', type=str, default='', help='Distribution of layers across GPUs. e.g. 2:1:1 for 2 layers on GPU 0, 1 layer on GPU 1, and 1 layer on GPU 2. Any remaining layers will be assigned to your last GPU.')
+    parser.add_argument('--layers-dist', type=str, default='',
+                        help='Distribution of layers across GPUs. e.g. 2:1:1 for 2 layers on GPU 0, 1 layer on GPU 1, and 1 layer on GPU 2. Any remaining layers will be assigned to your last GPU.')
     parser.add_argument('--observe',
                         action='store_true',
                         help='Auto upgrade layer precision to higher precision, for example int2 to int4, groupsize 128 to 64. \
             When this feature enabled, `--save` or `--save_safetensors` would be disable.')
-    parser.add_argument('--quant-directory', type=str, default=None, help='Specify the directory for export quantization parameters to toml format. `None` means no export by default.')
+    parser.add_argument('--quant-directory', type=str, default=None,
+                        help='Specify the directory for export quantization parameters to toml format. `None` means no export by default.')
     parser.add_argument('--step', action='store_true', help='')
     parser.add_argument('--step_bits', type=int, default=8)
     parser.add_argument('--method', type=str, default='', help='Method to use for quantization.')
     parser.add_argument('--sort-asym', action='store_true', help='Whether to sort asymmetric quantization levels.')
-    parser.add_argument('--alpha-method', type=str, default='fixed', choices=['fixed', 'alternate', 'sample'], help='Method to use for alpha update.')
+    parser.add_argument('--alpha-method', type=str, default='fixed', choices=['fixed', 'alternate', 'sample'],
+                        help='Method to use for alpha update.')
     parser.add_argument('--mixup-param', type=float, default=0.0, help='Mixup parameter for GreedyAQ.')
     parser.add_argument('--alpha', type=float, default=0.25, help='Coefficient for weight correction term')
     parser.add_argument('--beta', type=float, default=0.0003, help='Coefficient for weight correction term')
     parser.add_argument('--incoh-process', action='store_true', help='Whether to perform incoherence process.')
-    parser.add_argument('--incoh-mode', type=str, default='kron', choices=['had', 'kron'], help='Incoherence mode for GreedyAQ.')
+    parser.add_argument('--incoh-mode', type=str, default='kron', choices=['had', 'kron'],
+                        help='Incoherence mode for GreedyAQ.')
     parser.add_argument('--rescale-WH', action='store_true', help='Whether to rescale W and H to minimize proxy loss.')
     parser.add_argument('--rescale-D', action='store_true', help='Whether to rescale W and H to minimize proxy loss.')
-    parser.add_argument('--plot-delta-x', action='store_true', help='Whether to plot delta X values and generate 3D plots of |X_q - X_f|')
-    parser.add_argument('--plot-delta-x-path', type=str, default='plots/delta_x', help='Directory path to save delta X plots')
-    parser.add_argument('--eval-mae-validation', action='store_true', help='Collect MAE on C4 validation set and save for unified plotting')
-    parser.add_argument('--plot-unified-mae', type=str, default='', help='Path to directory containing pickle files with MAE data to plot. Files should be named like "validation_mae_alpha{alpha}.pkl"')
+    parser.add_argument('--plot-delta-x', action='store_true',
+                        help='Whether to plot delta X values and generate 3D plots of |X_q - X_f|')
+    parser.add_argument('--plot-delta-x-path', type=str, default='plots/delta_x',
+                        help='Directory path to save delta X plots')
+    parser.add_argument('--eval-mae-validation', action='store_true',
+                        help='Collect MAE on C4 validation set and save for unified plotting')
+    parser.add_argument('--plot-unified-mae', type=str, default='',
+                        help='Path to directory containing pickle files with MAE data to plot. Files should be named like "validation_mae_alpha{alpha}.pkl"')
     parser.add_argument('--ours', action='store_true', help='Use our method')
     parser.add_argument('--ours_v2', action='store_true', help='Use our method')
     parser.add_argument('--wandb', action='store_true', help='Enable wandb logging')
     parser.add_argument('--wandb-project', type=str, default='llm-quantization', help='Wandb project name')
     parser.add_argument('--wandb-name', type=str, default='', help='Wandb run name (default: auto-generated)')
-    parser.add_argument('--hessian-path', type=str, default='cache/hessians', help='Path to directory containing pre-computed Hessian files for GuidedQuant (default: cache/hessians)')
+    parser.add_argument('--hessian-path', type=str, default='cache/hessians',
+                        help='Path to directory containing pre-computed Hessian files for GuidedQuant (default: cache/hessians)')
 
     args = parser.parse_args()
 
@@ -900,7 +918,7 @@ if __name__ == '__main__':
     if args.load and not args.step:
         model = load_quant(args.model, args.load, args.wbits, args.groupsize)
     else:
-        model = get_qwen(args.model)
+        model = get_phi(args.model)
         model.eval()
         if args.step:
             print('load step!')
@@ -921,7 +939,7 @@ if __name__ == '__main__':
         # Default to gptq if method not specified
 
         tick = time.time()
-        quantizers = qwen3_sequential(model, dataloader, DEV, args.model)
+        quantizers = phi_sequential(model, dataloader, DEV, args.model)
         quant_time = time.time() - tick
         print(f"Quantization time: {quant_time}s")
         if args.wandb:
@@ -930,7 +948,7 @@ if __name__ == '__main__':
     if args.benchmark:
         gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
         if len(gpus) > 1:
-            Qwen_multigpu(model, gpus, gpu_dist)
+            phi_multigpu(model, gpus, gpu_dist)
         else:
             model = model.to(DEV)
         if args.benchmark:
@@ -946,7 +964,7 @@ if __name__ == '__main__':
         for dataset in datasets:
             testloader = get_loaders(dataset, seed=args.seed, model=args.model, seqlen=model.seqlen, eval_mode=True)
             print(dataset)
-            ppl = qwen_eval(model, testloader, DEV)
+            ppl = phi_eval(model, testloader, DEV)
             eval_results[f'{dataset}_perplexity'] = ppl
 
         if args.wandb:
@@ -957,7 +975,7 @@ if __name__ == '__main__':
     if args.eval_mae_validation:
         print('Collecting MAE on C4 validation set...')
         # Load full precision model for comparison
-        fp_model = get_qwen(args.model)
+        fp_model = get_phi(args.model)
         fp_model.eval()
 
         # Get C4 validation set
@@ -1160,11 +1178,12 @@ if __name__ == '__main__':
     if args.test_generation:
         gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
         if len(gpus) > 1:
-            Qwen_multigpu(model, gpus, gpu_dist)
+            phi_multigpu(model, gpus, gpu_dist)
         else:
             model = model.to(DEV)
 
         from transformers import LlamaTokenizer, TextStreamer
+
         tokenizer = LlamaTokenizer.from_pretrained(args.model, use_fast=False)
         input_ids = tokenizer(["The capital of New Mexico is"], return_tensors="pt").input_ids.to(gpus[0])
         streamer = TextStreamer(tokenizer)
@@ -1182,8 +1201,9 @@ if __name__ == '__main__':
         tokenizer.save_pretrained(f'ckpts/{args.save}')
 
     if not args.observe and args.save_safetensors:
-        qwen_pack(model, quantizers, args.wbits, args.groupsize)
+        phi_pack(model, quantizers, args.wbits, args.groupsize)
         from safetensors.torch import save_file as safe_save
+
         state_dict = model.state_dict()
         state_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
         safe_save(state_dict, args.save_safetensors)
