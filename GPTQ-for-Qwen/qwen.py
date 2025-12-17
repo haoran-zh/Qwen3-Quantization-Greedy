@@ -27,8 +27,9 @@ from algorithms.gptq import Observer  # Observer is the same across all algorith
 
 import tqdm
 
+DEFAULT_MODEL_NAME="Qwen/Qwen3-8B"
 
-def get_qwen(model='Qwen/Qwen3-8B'):
+def get_qwen(model=DEFAULT_MODEL_NAME):
 
     def skip(*args, **kwargs):
         pass
@@ -210,7 +211,7 @@ def qwen3_sequential(model, dataloader, dev):
                         if i == 0:
                             args.alpha_per_module[name] = [0.0]
                         if i == 1:
-                            if args.groupsize == -1 or args.model == "meta-llama/Llama-2-70b-hf":
+                            if args.groupsize == -1 or args.model == DEFAULT_MODEL_NAME:
                                 alpha_ref = 0.25
                             else:
                                 alpha_ref = 0.5
@@ -1164,8 +1165,8 @@ if __name__ == '__main__':
         else:
             model = model.to(DEV)
 
-        from transformers import LlamaTokenizer, TextStreamer
-        tokenizer = LlamaTokenizer.from_pretrained(args.model, use_fast=False)
+        from transformers import AutoTokenizer, TextStreamer
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
         input_ids = tokenizer(["The capital of New Mexico is"], return_tensors="pt").input_ids.to(gpus[0])
         streamer = TextStreamer(tokenizer)
         with torch.no_grad():

@@ -27,7 +27,9 @@ from algorithms.guidedquant import GuidedQuant
 from algorithms.gptq import Observer  # Observer is the same across all algorithms
 
 
-def get_mistral(model="mistralai/Mistral-7B-Instruct-v0.2"):
+DEFAULT_MODEL_NAME="mistralai/Mistral-7B-Instruct-v0.2"
+
+def get_mistral(model=DEFAULT_MODEL_NAME):
     def skip(*args, **kwargs):
         pass
 
@@ -209,7 +211,7 @@ def mistral_sequential(model, dataloader, dev):
                         if i == 0:
                             args.alpha_per_module[name] = [0.0]
                         if i == 1:
-                            if args.groupsize == -1 or args.model == "meta-llama/Llama-2-70b-hf":
+                            if args.groupsize == -1 or args.model == DEFAULT_MODEL_NAME:
                                 alpha_ref = 0.25
                             else:
                                 alpha_ref = 0.5
@@ -1180,9 +1182,9 @@ if __name__ == '__main__':
         else:
             model = model.to(DEV)
 
-        from transformers import LlamaTokenizer, TextStreamer
+        from transformers import AutoTokenizer, TextStreamer
 
-        tokenizer = LlamaTokenizer.from_pretrained(args.model, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
         input_ids = tokenizer(["The capital of New Mexico is"], return_tensors="pt").input_ids.to(gpus[0])
         streamer = TextStreamer(tokenizer)
         with torch.no_grad():
